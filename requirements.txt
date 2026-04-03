@@ -1,0 +1,32 @@
+# MODATA.AGENT — AgentOS + FastAPI project
+# LLM gọi qua HTTP từ remote host — không cài model local.
+
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# AgentOS + MCP (tối ưu cho nhiều tools)
+agentos>=0.2.0
+mcp>=1.0.0
+
+# Redis (permission store, caching)
+redis>=5.0.0
+
+# PostgreSQL (session store)
+psycopg2-binary>=2.9.9
+psycopg[binary]>=3.1.0
+sqlalchemy>=2.0.0
+
+# MongoDB (permission lookup)
+pymongo>=4.7.0
+
+# HTTP client (Keycloak JWKS)
+httpx>=0.27.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+
+# Logging & Monitoring
+structlog>=24.1.0

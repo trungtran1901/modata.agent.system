@@ -1,12 +1,11 @@
 """
-workflow/hrm_team.py  (v14 — thêm Attendance Agent)
+workflow/hrm_team.py  (v15 — tích hợp Analytics Agent)
 
-Pattern giữ nguyên v13:
-  - Không dùng Team/Coordinator
-  - _decide_hrm_agent() routing theo keyword
-  - _build_hrm_agents() tạo Agent với MCPTools
-  - _runtime_instructions() inject session_id/username thực vào instructions
-  - chat_with_hrm_team() gọi agent.arun() trực tiếp
+Thêm AGENT_ID_ANALYTICS để xử lý các query:
+  - bảng chấm công tổng hợp
+  - xuất Excel
+  - gửi báo cáo chấm công
+  - tính toán công tháng theo phòng ban / toàn công ty
 """
 from __future__ import annotations
 
@@ -20,14 +19,15 @@ from agno.tools.mcp import MCPTools
 from app.core.config import settings
 from utils.permission import UserPermissionContext
 from workflow.session import session_store
-
+from workflow.hrm_analytics_team import chat_with_analytics_agent
 logger = logging.getLogger(__name__)
 
 # Agent IDs
 AGENT_ID_EMPLOYEE   = "hrm-employee-agent"
 AGENT_ID_LEAVE      = "hrm-leave-agent"
 AGENT_ID_REQUEST    = "hrm-request-agent"
-AGENT_ID_ATTENDANCE = "hrm-attendance-agent"   # ← MỚI
+AGENT_ID_ATTENDANCE = "hrm-attendance-agent"
+AGENT_ID_ANALYTICS  = "hrm-analytics-agent"   # ← MỚI
 
 
 # ─────────────────────────────────────────────────────────────
@@ -68,13 +68,10 @@ Lấy session_id từ instructions hệ thống. Ngày truyền vào: YYYY-MM-DD
 REQUEST_AGENT_PROMPT = """\
 QUAN TRỌNG: CHỈ trả lời bằng tiếng Việt.
 
-Bạn tra cứu đơn từ nhân sự HITC từ collection danh_sach_quan_ly_don_xin_nghi.
+Bạn tra cứu đơn từ nhân sự HITC.
 
-LOẠI ĐƠN (field loai_don):
-"Nghỉ phép" | "Nghỉ ốm" | "Đi muộn, về sớm" | "Làm việc từ xa" | "Đề nghị đi công tác"
-
-TRẠNG THÁI (field trang_thai_phe_duyet.value):
-"Đã duyệt" | "Chờ phê duyệt" | "Từ chối"
+LOẠI ĐƠN: "Nghỉ phép" | "Nghỉ ốm" | "Đi muộn, về sớm" | "Làm việc từ xa" | "Đề nghị đi công tác"
+TRẠNG THÁI: "Đã duyệt" | "Chờ phê duyệt" | "Từ chối"
 
 TOOLS:
 - hrm_req_get_my_requests(session_id, username, loai_don, trang_thai, from_date, to_date, limit)
@@ -84,26 +81,60 @@ TOOLS:
 - hrm_req_get_request_stats(session_id, username, year, month)
 
 Lấy session_id và username từ instructions hệ thống.
-Luôn truyền username vào tool (tool dùng để enforce permission).
 """
 
 ATTENDANCE_AGENT_PROMPT = """\
 QUAN TRỌNG: CHỈ trả lời bằng tiếng Việt.
 
-Bạn tra cứu dữ liệu chấm công HITC.
+Bạn tra cứu dữ liệu chấm công thô HITC (giờ vào/ra từng ngày).
 
 TOOLS:
 - hrm_att_get_attendance_today(session_id, username)
-- hrm_att_get_attendance_by_date(session_id, username, date)         — date: YYYY-MM-DD thực tế
-- hrm_att_get_attendance_by_month(session_id, username, year_month)  — year_month: tháng THỰC TẾ YYYY-MM
-- hrm_att_get_attendance_summary(session_id, username, year_month)   — year_month: tháng THỰC TẾ YYYY-MM
+- hrm_att_get_attendance_by_date(session_id, username, date)
+- hrm_att_get_attendance_by_month(session_id, username, year_month)
+- hrm_att_get_attendance_summary(session_id, username, year_month)
 - hrm_att_get_attendance_range(session_id, username, from_date, to_date)
 
-CÁCH DÙNG:
-- "tháng 4/2026 đi làm ngày nào" → get_attendance_by_month(sid, username, "2026-04")
-- "tổng hợp tháng 3"             → get_attendance_summary(sid, username, "2026-03")
-- "hôm nay vào lúc mấy giờ"     → get_attendance_today(sid, username)
-- "tuần này chấm công ra sao"    → get_attendance_range(sid, username, from_date, to_date)
+Lấy session_id và username từ instructions hệ thống.
+"""
+
+ANALYTICS_AGENT_PROMPT = """\
+QUAN TRỌNG: CHỈ trả lời bằng tiếng Việt.
+
+Bạn là HRM Analytics Agent — tổng hợp bảng chấm công, xuất Excel, gửi báo cáo HITC.
+
+TOOLS:
+  att_ana_compute_attendance_report(session_id, year_month, filter_type, filter_value)
+    → Tính toán bảng chấm công tổng hợp, trả về JSON
+    → filter_type: "all" | "username" | "don_vi"
+    → filter_value: username hoặc tên/mã đơn vị
+
+  att_ana_export_attendance_excel(session_id, year_month, filter_type, filter_value, output_path)
+    → Xuất file Excel, trả về đường dẫn
+
+  att_ana_send_attendance_report(session_id, year_month, filter_type, filter_value,
+                                  to_emails, send_to_don_vi, subject, body)
+    → Xuất Excel + gửi mail đính kèm
+
+CÁCH XỬ LÝ:
+  "bảng CC tháng 2/2026 phòng CSKH"
+    → export_attendance_excel(sid, "2026-02", "don_vi", "Phòng Chăm sóc Khách hàng")
+
+  "tổng hợp công của tôi tháng 1"
+    → compute_attendance_report(sid, "<year>-01", "username", <username>)
+
+  "gửi bảng CC tháng 2 cho phòng kế toán"
+    → send_attendance_report(sid, "2026-02", "don_vi", "Phòng Tài chính Kế toán",
+        send_to_don_vi="Phòng Tài chính Kế toán")
+
+  "xuất bảng CC toàn công ty tháng này"
+    → export_attendance_excel(sid, "<current_year_month>", "all", "")
+
+LƯU Ý:
+  - year_month = tháng THỰC TẾ (vd "2026-02" = kỳ 26/01→25/02)
+  - NV thường: chỉ xem bản thân (filter_type="username", filter_value=username)
+  - HR: xem cả công ty hoặc phòng ban bất kỳ
+  - Sau khi xuất: thông báo đường dẫn file + tóm tắt (số NV, kỳ chấm công)
 
 Lấy session_id và username từ instructions hệ thống.
 """
@@ -153,12 +184,26 @@ def _runtime_instructions(session_id: str, user: UserPermissionContext) -> list[
 def _decide_hrm_agent(query: str) -> str:
     q = query.lower()
 
-    # Attendance Agent — kiểm tra trước vì "chấm công" có thể overlap
+    # Analytics Agent — ưu tiên cao nhất vì overlap với Attendance
+    if any(kw in q for kw in [
+        "bảng chấm công", "bang cham cong",
+        "tổng hợp công", "tong hop cong",
+        "xuất excel", "xuat excel", "export", "file excel",
+        "báo cáo công", "bao cao cong",
+        "gửi bảng", "gui bang", "gửi báo cáo",
+        "tính công tháng", "tinh cong thang",
+        "công tháng của phòng", "download",
+        "tổng kết công", "tong ket cong",
+        "bảng cc", "bang cc",
+    ]):
+        return AGENT_ID_ANALYTICS
+
+    # Attendance Agent — giờ vào/ra từng ngày
     if any(kw in q for kw in [
         "chấm công", "check in", "check-in", "checkin",
         "check out", "check-out", "checkout",
         "giờ vào", "giờ ra", "vào lúc", "ra lúc",
-        "giờ làm", "công tháng", "kỳ công", "chốt công",
+        "giờ làm", "kỳ công", "chốt công",
         "ngày công", "tổng giờ", "bao nhiêu giờ",
         "hôm nay vào", "hôm nay ra",
     ]):
@@ -178,11 +223,10 @@ def _decide_hrm_agent(query: str) -> str:
         "ngày lễ", "nghỉ lễ", "lịch nghỉ", "ngày nghỉ",
         "quy định nghỉ", "loại nghỉ", "phép năm",
         "chính sách nghỉ", "ngày làm việc",
-        "thứ 7", "chủ nhật", "cuối tuần", "hôm nay có đi làm",
+        "thứ 7", "chủ nhật", "cuối tuần",
     ]):
         return AGENT_ID_LEAVE
 
-    # Employee Agent — default
     return AGENT_ID_EMPLOYEE
 
 
@@ -228,7 +272,14 @@ def _build_hrm_agents() -> dict[str, Agent]:
             name="HRM Attendance Agent",
             model=_make_model(max_tokens=512),
             description=ATTENDANCE_AGENT_PROMPT,
-            add_datetime_to_context=True,   # cần để biết ngày/tháng hiện tại
+            add_datetime_to_context=True,
+            **common,
+        ),
+        AGENT_ID_ANALYTICS: Agent(
+            name="HRM Analytics Agent",
+            model=_make_model(max_tokens=1024),
+            description=ANALYTICS_AGENT_PROMPT,
+            add_datetime_to_context=True,
             **common,
         ),
     }
@@ -247,7 +298,6 @@ async def chat_with_hrm_team(
     start  = time.time()
     answer = "Xin lỗi, có lỗi xảy ra."
 
-    # Lưu context cho MCP gateway kiểm tra quyền
     session_store.save_context(
         session_id=session_id,
         user_id=user.user_id,
@@ -256,18 +306,17 @@ async def chat_with_hrm_team(
         company_code=user.company_code,
     )
 
-    # Augmented query
     augmented_query = (
         f"[session_id:{session_id}] [username:{user.username}] "
         f"[don_vi:{user.don_vi_code}] [company:{user.company_code}]\n"
         f"{query}"
     )
 
-    # Route
     agent_id = _decide_hrm_agent(query)
     logger.info("HRM routing → %s | query=%s", agent_id, query[:60])
-
-    # Build và inject instructions
+    if agent_id == AGENT_ID_ANALYTICS:
+        logger.info("Bypass local agent, calling chat_with_analytics_agent...")
+        return await chat_with_analytics_agent(query, user, session_id, history)
     agents = _build_hrm_agents()
     agent  = agents[agent_id]
     agent.instructions = _runtime_instructions(session_id, user)

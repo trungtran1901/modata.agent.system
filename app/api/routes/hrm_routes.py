@@ -5,6 +5,7 @@ HRM Team API — endpoints dành riêng cho Human Resource Management.
 
 Endpoints:
   POST /hrm/chat               — Chat với HRM Team (qua LLM)
+  POST /hrm/chat/stream        — Chat SSE streaming (text/event-stream)
   GET  /hrm/holidays           — Ngày nghỉ lễ trực tiếp (không qua LLM)
   GET  /hrm/leave-types        — Loại nghỉ phép trực tiếp
   GET  /hrm/weekly-off-rules   — Quy định nghỉ tuần trực tiếp
@@ -18,10 +19,11 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from utils.permission import PermissionService, UserPermissionContext
-from workflow.hrm_team import chat_with_hrm_team
+from workflow.hrm_team import chat_with_hrm_team, stream_with_hrm_team
 from workflow.session import session_store
 
 logger     = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ _perm_svc  = PermissionService()
 
 
 # ─────────────────────────────────────────────────────────────
-# AUTH DEPENDENCY — giống routes.py
+# AUTH DEPENDENCY
 # ─────────────────────────────────────────────────────────────
 
 async def get_user(authorization: str = Header(...)) -> UserPermissionContext:
@@ -54,9 +56,9 @@ class HRMChatRequest(BaseModel):
 class HRMChatResponse(BaseModel):
     session_id: str
     answer:     str
-    team:       str              = "HRM Team"
-    agents:     list[str]        = ["Employee Agent", "Leave Info Agent"]
-    sources:    list             = []
+    team:       str                      = "HRM Team"
+    agents:     list[str]                = ["Employee Agent", "Leave Info Agent"]
+    sources:    list                     = []
     metrics:    Optional[dict[str, Any]] = None
 
 
@@ -72,20 +74,18 @@ async def hrm_chat(
     """
     Chat với **HRM Team** — team AI chuyên nhân sự HITC.
 
-    Team gồm 2 agents chuyên biệt:
+    Team gồm nhiều agents chuyên biệt:
     - **Employee Agent**: tra cứu thông tin nhân viên, tìm kiếm, danh sách, thâm niên
     - **Leave Info Agent**: ngày nghỉ lễ, quy định nghỉ tuần, loại nghỉ phép
+    - **Request Agent**: tra cứu đơn từ nhân sự
+    - **Attendance Agent**: giờ vào/ra từng ngày
+    - **Analytics Agent**: bảng chấm công tổng hợp, xuất Excel, gửi báo cáo
 
     **Ví dụ query:**
     ```
     "Thông tin nhân viên của tôi"
-    "Tìm nhân viên tên Nguyễn Văn A"
-    "Danh sách nhân viên phòng Kế toán"
-    "Năm 2025 có những ngày nghỉ lễ nào?"
-    "Công ty nghỉ mấy ngày trong tuần?"
-    "Nghỉ phép được bao nhiêu ngày?"
-    "Ngày 02/09/2025 có phải ngày làm việc không?"
-    "Chính sách nghỉ phép của công ty là gì?"
+    "Bảng chấm công tháng 2/2026 của phòng CSKH"
+    "Xuất Excel bảng công toàn công ty tháng này"
     ```
     """
     try:
@@ -111,6 +111,68 @@ async def hrm_chat(
         logger.error("HRM chat error: %s", e, exc_info=True)
         raise HTTPException(500, str(e))
 
+
+@hrm_router.post("/chat/stream", summary="Chat với HRM Team — SSE streaming")
+async def hrm_chat_stream(
+    req:  HRMChatRequest,
+    user: UserPermissionContext = Depends(get_user),
+):
+    """
+    Chat với **HRM Team** theo chuẩn **Server-Sent Events**.
+
+    Response là `text/event-stream`, mỗi dòng có dạng:
+    ```
+    data: {"type": "token",  "content": "Xin chào..."}
+    data: {"type": "tool",   "name": "hrm_get_employee_info", "status": "start"}
+    data: {"type": "tool",   "name": "hrm_get_employee_info", "status": "end"}
+    data: {"type": "done",   "session_id": "...", "agent_id": "...", "metrics": {...}}
+    data: {"type": "error",  "message": "..."}
+    ```
+
+    **Ví dụ client JavaScript:**
+    ```js
+    const res = await fetch('/hrm/chat/stream', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer <token>', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: '...', session_id: '...' }),
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        for (const line of decoder.decode(value).split('\\n')) {
+            if (!line.startsWith('data: ')) continue;
+            const event = JSON.parse(line.slice(6));
+            if (event.type === 'token') appendText(event.content);
+            if (event.type === 'done')  console.log('Xong!', event.metrics);
+        }
+    }
+    ```
+    """
+    sid     = req.session_id or str(uuid.uuid4())
+    history = session_store.load(sid)
+
+    return StreamingResponse(
+        stream_with_hrm_team(
+            query=req.query,
+            user=user,
+            session_id=sid,
+            history=history,
+        ),
+        media_type="text/event-stream",
+        headers={
+            # Tắt buffering ở nginx — bắt buộc để stream hoạt động đúng
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# DIRECT ENDPOINTS (không qua LLM — giữ nguyên)
+# ─────────────────────────────────────────────────────────────
 
 @hrm_router.get("/holidays", summary="Danh sách ngày nghỉ lễ")
 async def get_holidays_direct(

@@ -1,25 +1,26 @@
 """
-workflow/hrm_team.py  (v15 — tích hợp Analytics Agent)
+workflow/hrm_team.py  (v16 — SSE streaming support)
 
-Thêm AGENT_ID_ANALYTICS để xử lý các query:
-  - bảng chấm công tổng hợp
-  - xuất Excel
-  - gửi báo cáo chấm công
-  - tính toán công tháng theo phòng ban / toàn công ty
+Thêm stream_with_hrm_team() để hỗ trợ Server-Sent Events.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
+from collections.abc import AsyncGenerator
 
 from agno.agent import Agent
-from agno.models.openai.like import OpenAILike
+# from agno.models.openai.like import OpenAILike
+from utils.qwen_model import QwenOpenAILike as OpenAILike
 from agno.tools.mcp import MCPTools
 
 from app.core.config import settings
 from utils.permission import UserPermissionContext
+from workflow.hrm_analytics_team import chat_with_analytics_agent, stream_with_analytics_agent
 from workflow.session import session_store
-from workflow.hrm_analytics_team import chat_with_analytics_agent
+from utils.qwen_tool_patch import make_qwen_model
 logger = logging.getLogger(__name__)
 
 # Agent IDs
@@ -27,11 +28,11 @@ AGENT_ID_EMPLOYEE   = "hrm-employee-agent"
 AGENT_ID_LEAVE      = "hrm-leave-agent"
 AGENT_ID_REQUEST    = "hrm-request-agent"
 AGENT_ID_ATTENDANCE = "hrm-attendance-agent"
-AGENT_ID_ANALYTICS  = "hrm-analytics-agent"   # ← MỚI
+AGENT_ID_ANALYTICS  = "hrm-analytics-agent"
 
 
 # ─────────────────────────────────────────────────────────────
-# PROMPTS
+# PROMPTS  (không thay đổi)
 # ─────────────────────────────────────────────────────────────
 
 EMPLOYEE_AGENT_PROMPT = """\
@@ -110,60 +111,9 @@ NHIỆM VỤ CHÍNH:
 
 TOOLS:
   att_ana_compute_attendance_report(session_id, year_month, filter_type, filter_value)
-    → Tính toán và trả về dữ liệu JSON bảng chấm công
-    → filter_type: "all" | "username" | "don_vi"
-    → filter_value: username hoặc mã/tên đơn vị (để trống nếu all)
-
   att_ana_export_attendance_excel(session_id, year_month, filter_type, filter_value, output_path)
-    → Tạo file Excel bảng chấm công, trả về đường dẫn file
-    → data_overrides: ĐÂY LÀ THAM SỐ QUAN TRỌNG ĐỂ ĐIỀU CHỈNH SỐ LIỆU. Truyền vào một chuỗi JSON nếu user yêu cầu sửa đổi/ép số liệu cụ thể cho ai đó. Định dạng: '{"mã_nv_hoặc_username": {"tên_cột_summary": giá_trị_mới}}'. 
-      Các tên cột summary gồm: "cong_tinh_luong", "tong_cong_thuc_te", "nghi_phep", "tru_sm", v.v...
-
   att_ana_send_attendance_report(session_id, year_month, filter_type, filter_value,
                                   to_emails, send_to_don_vi, subject, body)
-    → Xuất Excel VÀ gửi mail đính kèm, Hỗ trợ đè số liệu qua data_overrides như trên.
-    → to_emails: list email/username
-    → send_to_don_vi: tên/mã đơn vị để gửi cho cả phòng
-
-CÁCH XỬ LÝ THEO YÊU CẦU:
-  "bảng chấm công tháng 2/2026 của phòng CSKH"
-    → att_ana_export_attendance_excel(sid, "2026-02", "don_vi", "Phòng Chăm sóc Khách hàng")
-    → Thông báo đường dẫn file + tóm tắt kết quả
-
-  "tổng hợp công nhân viên B0011 tháng 1"
-    → att_ana_compute_attendance_report(sid, "<current_year>-01", "username", "B0011")
-    → Trình bày kết quả dạng bảng
-
-  "gửi bảng chấm công tháng 2 cho phòng kế toán"
-    → att_ana_send_attendance_report(sid, year_month, "don_vi", "Phòng Tài chính Kế toán",
-         send_to_don_vi="Phòng Tài chính Kế toán")
-    → Xác nhận đã gửi
-
-  "xuất bảng chấm công toàn công ty tháng này và gửi cho HR"
-    → att_ana_send_attendance_report(sid, year_month, "all", "",
-         to_emails=["hr@hitc.vn"])
-  - BÌNH THƯỜNG: "xuất bảng chấm công tháng 2/2026 của phòng CSKH"
-    → att_ana_export_attendance_excel(..., filter_type="don_vi", filter_value="Phòng Chăm sóc Khách hàng")
-
-  - CÓ ĐIỀU CHỈNH SỐ: "Xuất bảng chấm công phòng IT, nhưng cho nhân viên B0011 mặc định 26 công tính lương và nhân viên B0012 có 2 ngày nghỉ phép"
-    → att_ana_export_attendance_excel(
-          ..., 
-          filter_type="don_vi", filter_value="Phòng IT", 
-          custom_formula_notes="Đã điều chỉnh công theo yêu cầu: B0011 (26 công), B0012 (2 phép)",
-          data_overrides='{"B0011": {"cong_tinh_luong": 26}, "B0012": {"nghi_phep": 2}}'
-      )
-QUYỀN HẠN:
-  - HR/quản lý: xem và xuất của cả công ty / phòng ban bất kỳ
-  - NV thường: chỉ xem của bản thân (filter_type="username", filter_value=username)
-
-LƯU Ý VỀ KỲ CHẤM CÔNG:
-  - year_month là tháng THỰC TẾ: "2026-02" = kỳ 26/01 → 25/02/2026
-  - "tháng 2" → year_month = "<year>-02"
-  - "tháng này" → dùng ngày hiện tại để xác định tháng
-
-SAU KHI XUẤT EXCEL:
-  - Thông báo đường dẫn file: "Đã xuất file tại: /tmp/bang_cham_cong_..."
-  - Tóm tắt: số NV, kỳ chấm công, tổng công trung bình (nếu có)
 
 Lấy session_id và username từ instructions hệ thống.
 """
@@ -193,7 +143,15 @@ def _make_model(max_tokens: int = 512) -> OpenAILike:
             },
         },
     )
-
+# def _make_model(max_tokens: int = 512) -> QwenOpenAILike:
+#     url = settings.LLM_BASE_URL.rstrip("/")
+#     base_url = url if url.endswith("/v1") else f"{url}/v1"
+#     return make_qwen_model(
+#         llm_model=settings.LLM_MODEL,
+#         llm_api_key=settings.LLM_API_KEY or "none",
+#         llm_base_url=base_url,
+#         max_tokens=max_tokens,
+#     )
 
 def _runtime_instructions(session_id: str, user: UserPermissionContext) -> list[str]:
     return [
@@ -213,7 +171,6 @@ def _runtime_instructions(session_id: str, user: UserPermissionContext) -> list[
 def _decide_hrm_agent(query: str) -> str:
     q = query.lower()
 
-    # Analytics Agent — ưu tiên cao nhất vì overlap với Attendance
     if any(kw in q for kw in [
         "bảng chấm công", "bang cham cong",
         "tổng hợp công", "tong hop cong",
@@ -227,7 +184,6 @@ def _decide_hrm_agent(query: str) -> str:
     ]):
         return AGENT_ID_ANALYTICS
 
-    # Attendance Agent — giờ vào/ra từng ngày
     if any(kw in q for kw in [
         "chấm công", "check in", "check-in", "checkin",
         "check out", "check-out", "checkout",
@@ -238,7 +194,6 @@ def _decide_hrm_agent(query: str) -> str:
     ]):
         return AGENT_ID_ATTENDANCE
 
-    # Request Agent
     if any(kw in q for kw in [
         "đơn", "xin nghỉ", "nghỉ phép", "nghỉ ốm",
         "đi muộn", "về sớm", "remote", "làm việc từ xa",
@@ -247,7 +202,6 @@ def _decide_hrm_agent(query: str) -> str:
     ]):
         return AGENT_ID_REQUEST
 
-    # Leave Info Agent
     if any(kw in q for kw in [
         "ngày lễ", "nghỉ lễ", "lịch nghỉ", "ngày nghỉ",
         "quy định nghỉ", "loại nghỉ", "phép năm",
@@ -315,7 +269,7 @@ def _build_hrm_agents() -> dict[str, Agent]:
 
 
 # ─────────────────────────────────────────────────────────────
-# CHAT BRIDGE
+# CHAT BRIDGE  (response đầy đủ — không thay đổi)
 # ─────────────────────────────────────────────────────────────
 
 async def chat_with_hrm_team(
@@ -343,9 +297,11 @@ async def chat_with_hrm_team(
 
     agent_id = _decide_hrm_agent(query)
     logger.info("HRM routing → %s | query=%s", agent_id, query[:60])
+
     if agent_id == AGENT_ID_ANALYTICS:
         logger.info("Bypass local agent, calling chat_with_analytics_agent...")
         return await chat_with_analytics_agent(query, user, session_id, history)
+
     agents = _build_hrm_agents()
     agent  = agents[agent_id]
     agent.instructions = _runtime_instructions(session_id, user)
@@ -384,3 +340,138 @@ async def chat_with_hrm_team(
         "sources":    [],
         "metrics":    {"total_duration": duration, "agent_id": agent_id},
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# SSE STREAM BRIDGE  ← MỚI
+# ─────────────────────────────────────────────────────────────
+
+async def stream_with_hrm_team(
+    query:      str,
+    user:       UserPermissionContext,
+    session_id: str,
+    history:    list[dict],
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator trả về các SSE event string.
+    Dùng với FastAPI StreamingResponse(media_type="text/event-stream").
+
+    Event format:
+      data: {"type": "token",    "content": "..."}\\n\\n
+      data: {"type": "tool",     "name": "...", "status": "start"|"end"}\\n\\n
+      data: {"type": "done",     "session_id": "...", "agent_id": "..."}\\n\\n
+      data: {"type": "error",    "message": "..."}\\n\\n
+    """
+    start    = time.time()
+    agent_id = _decide_hrm_agent(query)
+    logger.info("HRM SSE routing → %s | query=%s", agent_id, query[:60])
+
+    session_store.save_context(
+        session_id=session_id,
+        user_id=user.user_id,
+        username=user.username,
+        accessible=user.accessible_instance_names,
+        company_code=user.company_code,
+    )
+
+    # Analytics agent có stream riêng
+    if agent_id == AGENT_ID_ANALYTICS:
+        async for chunk in stream_with_analytics_agent(query, user, session_id, history):
+            yield chunk
+        return
+
+    augmented_query = (
+        f"[session_id:{session_id}] [username:{user.username}] "
+        f"[don_vi:{user.don_vi_code}] [company:{user.company_code}]\n"
+        f"{query}"
+    )
+
+    agents = _build_hrm_agents()
+    agent  = agents[agent_id]
+    agent.instructions = _runtime_instructions(session_id, user)
+
+    full_answer = ""
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _run_sync():
+        """Chạy agent.run(stream=True) trong thread riêng, đẩy chunks vào queue."""
+        try:
+            for chunk in agent.run(
+                augmented_query,
+                session_id=session_id,
+                user_id=user.user_id,
+                stream=True,
+                stream_intermediate_steps=True,
+            ):
+                queue.put_nowait(chunk)
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(None)  # sentinel
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _run_sync)
+
+    try:
+        while True:
+            chunk = await queue.get()
+
+            if chunk is None:           # sentinel — xong
+                break
+            if isinstance(chunk, Exception):
+                raise chunk
+
+            event_type = getattr(chunk, "event", None)
+
+            # Tool call bắt đầu
+            if event_type == "ToolCallStarted":
+                tool_name = getattr(chunk, "tool_name", "unknown")
+                yield _sse({"type": "tool", "name": tool_name, "status": "start"})
+
+            # Tool call kết thúc
+            elif event_type == "ToolCallCompleted":
+                tool_name = getattr(chunk, "tool_name", "unknown")
+                yield _sse({"type": "tool", "name": tool_name, "status": "end"})
+
+            # Token text delta
+            elif event_type == "RunResponseContentDelta":
+                delta = getattr(chunk, "content", "") or ""
+                if delta:
+                    full_answer += delta
+                    yield _sse({"type": "token", "content": delta})
+
+            # Fallback: chunk có content trực tiếp (agno cũ trả về RunResponse)
+            elif hasattr(chunk, "content") and chunk.content and event_type is None:
+                content = chunk.content or ""
+                if content and not full_answer:
+                    full_answer = content
+                    yield _sse({"type": "token", "content": content})
+
+    except Exception as e:
+        logger.error(
+            "HRM SSE error: agent=%s session=%s user=%s error=%s",
+            agent_id, session_id, user.username, e, exc_info=True,
+        )
+        yield _sse({"type": "error", "message": str(e)})
+        full_answer = f"Xin lỗi, có lỗi xảy ra: {str(e)}"
+
+    # Lưu history
+    updated = (history + [
+        {"role": "user",      "content": query},
+        {"role": "assistant", "content": full_answer},
+    ])[-40:]
+    session_store.save(session_id, user.user_id, user.username, updated)
+
+    duration = round(time.time() - start, 3)
+    yield _sse({
+        "type":       "done",
+        "session_id": session_id,
+        "agent_id":   agent_id,
+        "team":       "HRM Team",
+        "metrics":    {"total_duration": duration},
+    })
+
+
+def _sse(data: dict) -> str:
+    """Chuyển dict thành SSE event string."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"

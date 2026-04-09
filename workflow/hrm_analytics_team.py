@@ -2,54 +2,54 @@
 workflow/hrm_analytics_team.py
 
 HRM Analytics Agent — tổng hợp bảng chấm công, xuất Excel, gửi báo cáo.
-
-Agent sử dụng các tools:
-  att_ana_compute_attendance_report  — tính toán dữ liệu
-  att_ana_export_attendance_excel    — xuất Excel
-  att_ana_send_attendance_report     — gửi mail + Excel
-
-Phối hợp với HRM Team qua hrm_team.py nếu cần tra cứu thêm.
+Thêm stream_with_analytics_agent() để hỗ trợ SSE streaming.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
+from collections.abc import AsyncGenerator
 
 from agno.agent import Agent
-from agno.models.openai.like import OpenAILike
+# from agno.models.openai.like import OpenAILike
+from utils.qwen_model import QwenOpenAILike as OpenAILike
 from agno.tools.mcp import MCPTools
 
 from app.core.config import settings
 from utils.permission import UserPermissionContext
 from workflow.session import session_store
-
+from utils.qwen_tool_patch import make_qwen_model
 logger = logging.getLogger(__name__)
 
 AGENT_ID_ANALYTICS = "hrm-analytics-agent"
 
 # ─────────────────────────────────────────────────────────────
-# SYSTEM PROMPT
+# SYSTEM PROMPT  (không thay đổi)
 # ─────────────────────────────────────────────────────────────
 
 ANALYTICS_AGENT_PROMPT = """\
 QUAN TRỌNG: CHỈ trả lời bằng tiếng Việt.
 
 Bạn là HRM Analytics Agent — chuyên tổng hợp và xuất bảng chấm công HITC.
-QUY TRÌNH TƯ DUY (THỰC HIỆN THEO THỨ TỰ):
-1. XÁC ĐỊNH ĐỐI TƯỢNG: Nếu user nói tên người (ví dụ "ông Hải"), bạn KHÔNG ĐƯỢC đoán mã NV. Hãy gọi tool tra cứu nhân viên để lấy 'ma_nv' chính xác (ví dụ B0495).
-2. TÙY BIẾN CỘT: Nếu user yêu cầu thêm thông tin không có trong bảng gốc (ví dụ "Thưởng dự án", "Xếp loại"), hãy điền tên cột và giá trị mặc định vào tham số `extra_columns`.
-3. ĐIỀU CHỈNH SỐ LIỆU: Điền các giá trị cần sửa vào `data_overrides` theo đúng 'ma_nv'. 
-   - Để "pass" đi muộn: Phải set cả 'tru_sm': 0, 'dm_gt_4h': 0, 'dm_1h_4h': 0, 'phut_muon_lt_1h': 0.
-
-VÍ DỤ LỆNH: "Cho ông Vương Ngọc Hải 26 công, xóa mọi lỗi đi muộn và thêm cột 'Thưởng nóng' 1 triệu"
-BƯỚC 1: Tìm "Vương Ngọc Hải" -> Trả về ma_nv "B0495".
-BƯỚC 2: Gọi export_attendance_excel với:
-  extra_columns='{"Thưởng nóng": 0}'
-  data_overrides='{"B0495": {"cong_tinh_luong": 26, "tru_sm": 0, "dm_gt_4h": 0, "dm_1h_4h": 0, "phut_muon_lt_1h": 0, "Thưởng nóng": 1000000}}'
 NHIỆM VỤ CHÍNH:
   1. Tính toán bảng chấm công tổng hợp (1 NV / phòng ban / toàn công ty)
   2. Xuất file Excel bảng chấm công
   3. Gửi mail kèm file Excel cho NV / phòng ban
+
+QUYỀN HẠN ĐIỀU CHỈNH:
+  Agent CÓ THỂ sửa BẤT KỲ FIELD NÀO trong summary, vd:
+    - dm_gt_4h, dm_1h_4h, phut_muon_lt_1h (ngày đi muộn/về sớm)
+    - nghi_phep, nghi_le, wfh, cong_tac (loại nghỉ)
+    - so_cong_chuan (công chuẩn tháng)
+    - tru_sm (trừ sớm-muộn)
+    - cong_tinh_luong (công tính lương trực tiếp)
+    - Hoặc BẤT KỲ FIELD NÀO khác
+  
+  NẾU agent sửa:
+    → Công thức phụ thuộc TỰĐỘNG tính lại
+    → Không cần agent tính thủ công
 
 TOOLS:
   att_ana_compute_attendance_report(session_id, year_month, filter_type, filter_value)
@@ -59,42 +59,28 @@ TOOLS:
 
   att_ana_export_attendance_excel(session_id, year_month, filter_type, filter_value, output_path)
     → Tạo file Excel bảng chấm công, trả về đường dẫn file
-    → data_overrides: ĐÂY LÀ THAM SỐ QUAN TRỌNG ĐỂ ĐIỀU CHỈNH SỐ LIỆU. Truyền vào một chuỗi JSON nếu user yêu cầu sửa đổi/ép số liệu cụ thể cho ai đó. Định dạng: '{"mã_nv_hoặc_username": {"tên_cột_summary": giá_trị_mới}}'. 
-      Các tên cột summary gồm: "cong_tinh_luong", "tong_cong_thuc_te", "nghi_phep", "tru_sm", v.v...
+    → data_overrides: '{"mã_nv": {"tên_cột": giá_trị}}'
 
   att_ana_send_attendance_report(session_id, year_month, filter_type, filter_value,
                                   to_emails, send_to_don_vi, subject, body)
-    → Xuất Excel VÀ gửi mail đính kèm, Hỗ trợ đè số liệu qua data_overrides như trên.
+    → Xuất Excel VÀ gửi mail đính kèm
     → to_emails: list email/username
     → send_to_don_vi: tên/mã đơn vị để gửi cho cả phòng
 
 CÁCH XỬ LÝ THEO YÊU CẦU:
   "bảng chấm công tháng 2/2026 của phòng CSKH"
     → att_ana_export_attendance_excel(sid, "2026-02", "don_vi", "Phòng Chăm sóc Khách hàng")
-    → Thông báo đường dẫn file + tóm tắt kết quả
+
+  "Cho ông B0560 pass hết tất cả ngày đi muộn"
+    → data_overrides: {"B0560": {"dm_gt_4h": 0, "dm_1h_4h": 0, "phut_muon_lt_1h": 0}}
 
   "tổng hợp công nhân viên B0011 tháng 1"
     → att_ana_compute_attendance_report(sid, "<current_year>-01", "username", "B0011")
-    → Trình bày kết quả dạng bảng
 
   "gửi bảng chấm công tháng 2 cho phòng kế toán"
     → att_ana_send_attendance_report(sid, year_month, "don_vi", "Phòng Tài chính Kế toán",
          send_to_don_vi="Phòng Tài chính Kế toán")
-    → Xác nhận đã gửi
 
-  "xuất bảng chấm công toàn công ty tháng này và gửi cho HR"
-    → att_ana_send_attendance_report(sid, year_month, "all", "",
-         to_emails=["hr@hitc.vn"])
-  - BÌNH THƯỜNG: "xuất bảng chấm công tháng 2/2026 của phòng CSKH"
-    → att_ana_export_attendance_excel(..., filter_type="don_vi", filter_value="Phòng Chăm sóc Khách hàng")
-
-  - CÓ ĐIỀU CHỈNH SỐ: "Xuất bảng chấm công phòng IT, nhưng cho nhân viên B0011 mặc định 26 công tính lương và nhân viên B0012 có 2 ngày nghỉ phép"
-    → att_ana_export_attendance_excel(
-          ..., 
-          filter_type="don_vi", filter_value="Phòng IT", 
-          custom_formula_notes="Đã điều chỉnh công theo yêu cầu: B0011 (26 công), B0012 (2 phép)",
-          data_overrides='{"B0011": {"cong_tinh_luong": 26}, "B0012": {"nghi_phep": 2}}'
-      )
 QUYỀN HẠN:
   - HR/quản lý: xem và xuất của cả công ty / phòng ban bất kỳ
   - NV thường: chỉ xem của bản thân (filter_type="username", filter_value=username)
@@ -136,7 +122,15 @@ def _make_model(max_tokens: int = 1024) -> OpenAILike:
             },
         },
     )
-
+# def _make_model(max_tokens: int = 512) -> QwenOpenAILike:
+#     url = settings.LLM_BASE_URL.rstrip("/")
+#     base_url = url if url.endswith("/v1") else f"{url}/v1"
+#     return make_qwen_model(
+#         llm_model=settings.LLM_MODEL,
+#         llm_api_key=settings.LLM_API_KEY or "none",
+#         llm_base_url=base_url,
+#         max_tokens=max_tokens,
+#     )
 
 def _runtime_instructions(session_id: str, user: UserPermissionContext) -> list[str]:
     return [
@@ -150,32 +144,10 @@ def _runtime_instructions(session_id: str, user: UserPermissionContext) -> list[
     ]
 
 
-def _is_analytics_query(query: str) -> bool:
-    """Phát hiện query liên quan đến bảng chấm công / xuất Excel."""
-    q = query.lower()
-    keywords = [
-        "bảng chấm công", "bang cham cong",
-        "tổng hợp công", "tong hop cong",
-        "xuất excel", "xuat excel", "export",
-        "báo cáo công", "bao cao cong",
-        "gửi bảng", "gui bang",
-        "tính công", "tinh cong",
-        "công tháng", "cong thang",
-        "file excel", "download",
-        "analytics", "thống kê chấm công",
-    ]
-    return any(kw in q for kw in keywords)
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_analytics_agent() -> Agent:
+def _build_analytics_agent() -> Agent:
     mcp = MCPTools(
         url=settings.MCP_GATEWAY_URL,
-        transport="sse"
-        # session_kwargs={"timeout": 60}
+        transport="sse",
     )
     return Agent(
         name="HRM Analytics Agent",
@@ -188,8 +160,28 @@ def build_analytics_agent() -> Agent:
     )
 
 
+def _sse(data: dict) -> str:
+    """Chuyển dict thành SSE event string."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _prepare_session(session_id: str, user: UserPermissionContext, query: str) -> str:
+    session_store.save_context(
+        session_id=session_id,
+        user_id=user.user_id,
+        username=user.username,
+        accessible=user.accessible_instance_names,
+        company_code=user.company_code,
+    )
+    return (
+        f"[session_id:{session_id}] [username:{user.username}] "
+        f"[don_vi:{user.don_vi_code}] [company:{user.company_code}]\n"
+        f"{query}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────
-# CHAT BRIDGE
+# CHAT BRIDGE  (response đầy đủ — không thay đổi)
 # ─────────────────────────────────────────────────────────────
 
 async def chat_with_analytics_agent(
@@ -198,25 +190,11 @@ async def chat_with_analytics_agent(
     session_id: str,
     history:    list[dict],
 ) -> dict:
-    """Entry point cho analytics queries từ HRM routes hoặc general chat."""
-    start  = time.time()
-    answer = "Xin lỗi, có lỗi xảy ra."
+    start         = time.time()
+    answer        = "Xin lỗi, có lỗi xảy ra."
+    augmented_query = _prepare_session(session_id, user, query)
 
-    session_store.save_context(
-        session_id=session_id,
-        user_id=user.user_id,
-        username=user.username,
-        accessible=user.accessible_instance_names,
-        company_code=user.company_code,
-    )
-
-    augmented_query = (
-        f"[session_id:{session_id}] [username:{user.username}] "
-        f"[don_vi:{user.don_vi_code}] [company:{user.company_code}]\n"
-        f"{query}"
-    )
-
-    agent = build_analytics_agent()
+    agent = _build_analytics_agent()
     agent.instructions = _runtime_instructions(session_id, user)
 
     try:
@@ -253,3 +231,106 @@ async def chat_with_analytics_agent(
         "sources":    [],
         "metrics":    {"total_duration": duration, "agent_id": AGENT_ID_ANALYTICS},
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# SSE STREAM BRIDGE  ← MỚI
+# ─────────────────────────────────────────────────────────────
+
+async def stream_with_analytics_agent(
+    query:      str,
+    user:       UserPermissionContext,
+    session_id: str,
+    history:    list[dict],
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator trả về các SSE event string.
+    Dùng với FastAPI StreamingResponse(media_type="text/event-stream").
+
+    Event format:
+      data: {"type": "token",    "content": "..."}\\n\\n
+      data: {"type": "tool",     "name": "...", "status": "start"|"end"}\\n\\n
+      data: {"type": "done",     "session_id": "...", "agent_id": "..."}\\n\\n
+      data: {"type": "error",    "message": "..."}\\n\\n
+    """
+    start           = time.time()
+    full_answer     = ""
+    augmented_query = _prepare_session(session_id, user, query)
+
+    agent = _build_analytics_agent()
+    agent.instructions = _runtime_instructions(session_id, user)
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _run_sync():
+        try:
+            for chunk in agent.run(
+                augmented_query,
+                session_id=session_id,
+                user_id=user.user_id,
+                stream=True,
+                stream_intermediate_steps=True,
+            ):
+                queue.put_nowait(chunk)
+        except Exception as e:
+            queue.put_nowait(e)
+        finally:
+            queue.put_nowait(None)
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _run_sync)
+
+    try:
+        while True:
+            chunk = await queue.get()
+
+            if chunk is None:
+                break
+            if isinstance(chunk, Exception):
+                raise chunk
+
+            event_type = getattr(chunk, "event", None)
+
+            if event_type == "ToolCallStarted":
+                tool_name = getattr(chunk, "tool_name", "unknown")
+                yield _sse({"type": "tool", "name": tool_name, "status": "start"})
+
+            elif event_type == "ToolCallCompleted":
+                tool_name = getattr(chunk, "tool_name", "unknown")
+                yield _sse({"type": "tool", "name": tool_name, "status": "end"})
+
+            elif event_type == "RunResponseContentDelta":
+                delta = getattr(chunk, "content", "") or ""
+                if delta:
+                    full_answer += delta
+                    yield _sse({"type": "token", "content": delta})
+
+            elif hasattr(chunk, "content") and chunk.content and event_type is None:
+                content = chunk.content or ""
+                if content and not full_answer:
+                    full_answer = content
+                    yield _sse({"type": "token", "content": content})
+
+    except Exception as e:
+        logger.error(
+            "Analytics SSE error: session=%s user=%s error=%s",
+            session_id, user.username, e, exc_info=True,
+        )
+        yield _sse({"type": "error", "message": str(e)})
+        full_answer = f"Xin lỗi, có lỗi xảy ra: {str(e)}"
+
+    # Lưu history
+    updated = (history + [
+        {"role": "user",      "content": query},
+        {"role": "assistant", "content": full_answer},
+    ])[-40:]
+    session_store.save(session_id, user.user_id, user.username, updated)
+
+    duration = round(time.time() - start, 3)
+    yield _sse({
+        "type":       "done",
+        "session_id": session_id,
+        "agent_id":   AGENT_ID_ANALYTICS,
+        "team":       "HRM Analytics",
+        "metrics":    {"total_duration": duration},
+    })

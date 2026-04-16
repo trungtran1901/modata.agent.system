@@ -1,16 +1,27 @@
 """
 utils/permission.py
 
-Flow:
-1. Verify Keycloak Bearer JWT → lấy preferred_username
-2. Tra MongoDB instance_data_thong_tin_nhan_vien → lấy thông tin nhân viên
-3. Tra MongoDB instance_data_danh_sach_phan_quyen_chuc_nang → lọc chức năng có quyền
-4. Tra MongoDB instance_data_sys_conf_view → map ma_chuc_nang → instance_name
+Flow xác thực hỗ trợ 2 phương thức:
+
+Phương thức 1 — Bearer JWT (Keycloak):
+  Header: Authorization: Bearer <token>
+  1. Verify JWT → lấy preferred_username
+  2. Tra MongoDB instance_data_thong_tin_nhan_vien → thông tin nhân viên
+  3. Tra MongoDB instance_data_danh_sach_phan_quyen_chuc_nang → lọc chức năng
+  4. Tra MongoDB instance_data_sys_conf_view → map ma_chuc_nang → instance_name
+
+Phương thức 2 — API Key:
+  Header: X-Api-Key: <api_key>
+  1. Tra MongoDB instance_data_danh_sach_api_key → xác thực api_key, lấy ten_dang_nhap
+  2. Kiểm tra is_active, is_deleted, ngay_het_han_token
+  3. Tra MongoDB instance_data_thong_tin_nhan_vien theo ten_dang_nhap → thông tin nhân viên
+  4. Tiếp tục flow phân quyền giống Bearer JWT (bước 3, 4 ở trên)
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 from jose import jwt, JWTError
@@ -21,6 +32,9 @@ from app.db.mongo import get_db
 
 logger = logging.getLogger(__name__)
 
+# Tên collection chứa danh sách API Key
+_COL_API_KEY = "instance_data_danh_sach_api_key"
+
 
 # ─────────────────────────────────────────────────────────────
 # DATA MODEL
@@ -28,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UserPermissionContext:
-    # Từ Keycloak JWT
+    # Từ Keycloak JWT hoặc API Key record
     user_id:  str
     username: str
     email:    str
@@ -45,6 +59,9 @@ class UserPermissionContext:
     accessible_ma_chuc_nang:   set[str]            = field(default_factory=set)
     # {instance_name: [ma_chuc_nang, ...]} — format mới cho view-based permission
     accessible_instance_names: dict[str, list[str]] = field(default_factory=dict)
+
+    # Phương thức xác thực đã dùng (để debug / audit log)
+    auth_method: str = "bearer"   # "bearer" | "api_key"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,6 +96,54 @@ class PermissionService:
             return payload
         except JWTError as e:
             raise PermissionError(f"Invalid token: {e}")
+
+    # ── MongoDB: xác thực API Key ─────────────────────────────
+
+    @staticmethod
+    def _verify_api_key(api_key: str) -> str:
+        """
+        Tra collection instance_data_danh_sach_api_key, kiểm tra:
+          - api_key khớp
+          - is_deleted != true
+          - is_active == true
+          - ngay_het_han_token chưa quá hạn (hoặc null = không giới hạn)
+
+        Trả về ten_dang_nhap nếu hợp lệ, raise PermissionError nếu không.
+        """
+        doc = get_db()[_COL_API_KEY].find_one(
+            {
+                "api_key":    api_key,
+                "is_deleted": {"$ne": True},
+                "is_active":  {"$ne": False},
+            },
+            {
+                "ten_dang_nhap": 1,
+                "ho_va_ten":     1,
+                "email":         1,
+                "company_code":  1,
+                "ngay_het_han_token": 1,
+            },
+        )
+
+        if not doc:
+            raise PermissionError("API Key không hợp lệ hoặc đã bị vô hiệu hoá")
+
+        # Kiểm tra ngày hết hạn (nếu có)
+        expiry = doc.get("ngay_het_han_token")
+        if expiry is not None:
+            # Chuẩn hoá: MongoDB có thể trả datetime naive hoặc aware
+            if isinstance(expiry, datetime):
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if datetime.now(tz=timezone.utc) > expiry:
+                    raise PermissionError("API Key đã hết hạn")
+
+        username = doc.get("ten_dang_nhap", "").strip()
+        if not username:
+            raise PermissionError("API Key không liên kết với tài khoản hợp lệ")
+
+        logger.info("API Key OK — ten_dang_nhap: %s", username)
+        return username
 
     # ── MongoDB: lấy thông tin nhân viên ─────────────────────
 
@@ -187,7 +252,6 @@ class PermissionService:
         return result
 
     # ── MongoDB: map ma_chuc_nang → instance_name ────────────
-    # ── MongoDB: map ma_chuc_nang → instance_name ────────────
 
     @staticmethod
     def _get_accessible_instances(ma_list: list[str]) -> dict[str, list[str]]:
@@ -215,32 +279,37 @@ class PermissionService:
                     result[inst].append(ma)
         return result
 
-    # ── Entry point ───────────────────────────────────────────
+    # ── Shared: build context từ username ────────────────────
 
-    async def build_context(self, bearer: str) -> UserPermissionContext:
-        payload  = await self.verify_token(bearer)
-        username = payload.get("preferred_username", "")
-        user_id  = payload.get("sub", "")
-        email    = payload.get("email", "")
-        roles    = payload.get("realm_access", {}).get("roles", [])
-
-        logger.info("Token OK — user: %s | roles: %s", username, roles)
-
+    def _build_context_from_username(
+        self,
+        user_id:     str,
+        username:    str,
+        email:       str,
+        roles:       list[str],
+        auth_method: str,
+    ) -> UserPermissionContext:
+        """
+        Dùng chung cho cả Bearer JWT và API Key sau khi đã có username.
+        Tra nhân viên → phân quyền → trả UserPermissionContext.
+        """
         nv = self._get_nhan_vien(username)
         if not nv:
             logger.warning("Không tìm thấy nhân viên: %s", username)
             return UserPermissionContext(
-                user_id=user_id, username=username, email=email, roles=roles
+                user_id=user_id, username=username,
+                email=email, roles=roles,
+                auth_method=auth_method,
             )
 
         dv          = nv.get("don_vi_cong_tac") or {}
         don_vi_code = (
             (dv.get("option") or {}).get("code") or dv.get("value", "")
         ) if isinstance(dv, dict) else ""
-        don_vi_path    = nv.get("path_don_vi_cong_tac") or ""
-        vi_tri         = nv.get("vi_tri_cong_viec")
-        company        = nv.get("company_code") or settings.DEFAULT_COMPANY_CODE
-        nv_vai_tro     = [
+        don_vi_path = nv.get("path_don_vi_cong_tac") or ""
+        vi_tri      = nv.get("vi_tri_cong_viec")
+        company     = nv.get("company_code") or settings.DEFAULT_COMPANY_CODE
+        nv_vai_tro  = [
             v.get("value", "") for v in (nv.get("vai_tro") or [])
             if isinstance(v, dict) and v.get("value")
         ]
@@ -249,8 +318,8 @@ class PermissionService:
         instances = self._get_accessible_instances(ma_list)
 
         logger.info(
-            "User %s → %d chức năng, %d collections",
-            username, len(ma_list), len(instances),
+            "User %s (%s) → %d chức năng, %d collections",
+            username, auth_method, len(ma_list), len(instances),
         )
 
         return UserPermissionContext(
@@ -258,5 +327,44 @@ class PermissionService:
             company_code=company, don_vi_code=don_vi_code, don_vi_path=don_vi_path,
             vi_tri_cong_viec=vi_tri, nhan_vien_vai_tro=nv_vai_tro,
             accessible_ma_chuc_nang=set(ma_list),
-            accessible_instance_names=instances,  # dict[instance_name, list[ma]]
+            accessible_instance_names=instances,
+            auth_method=auth_method,
+        )
+
+    # ── Entry point: Bearer JWT ───────────────────────────────
+
+    async def build_context(self, bearer: str) -> UserPermissionContext:
+        """Xác thực Bearer JWT → build UserPermissionContext."""
+        payload  = await self.verify_token(bearer)
+        username = payload.get("preferred_username", "")
+        user_id  = payload.get("sub", "")
+        email    = payload.get("email", "")
+        roles    = payload.get("realm_access", {}).get("roles", [])
+
+        logger.info("Token OK — user: %s | roles: %s", username, roles)
+
+        return self._build_context_from_username(
+            user_id=user_id,
+            username=username,
+            email=email,
+            roles=roles,
+            auth_method="bearer",
+        )
+
+    # ── Entry point: API Key ──────────────────────────────────
+
+    def build_context_from_api_key(self, api_key: str) -> UserPermissionContext:
+        """
+        Xác thực X-Api-Key → build UserPermissionContext.
+        Đồng bộ (không async) vì chỉ dùng MongoDB, không cần HTTP call.
+        """
+        username = self._verify_api_key(api_key)
+
+        # API Key không có JWT payload → dùng ten_dang_nhap làm user_id
+        return self._build_context_from_username(
+            user_id=username,
+            username=username,
+            email="",       # sẽ được lấy từ bảng nhân viên nếu có
+            roles=[],       # API Key không có Keycloak roles
+            auth_method="api_key",
         )

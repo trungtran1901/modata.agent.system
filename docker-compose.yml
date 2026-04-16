@@ -1,39 +1,40 @@
 services:
 
-  # ── PostgreSQL (session store) ────────────────────────────
-  postgres:
-    image: postgres:16-alpine
-    container_name: modata-agent-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER:     ${PG_USER:-admin}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-change_me}
-      POSTGRES_DB:       ${PG_DATABASE:-vectordb}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-admin} -d ${PG_DATABASE:-vectordb}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # # ── PostgreSQL (session store) ────────────────────────────
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: modata-agent-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER:     ${PG_USER:-admin}
+  #     POSTGRES_PASSWORD: ${PG_PASSWORD:-change_me}
+  #     POSTGRES_DB:       ${PG_DATABASE:-vectordb}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-admin} -d ${PG_DATABASE:-vectordb}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
 
   # ── Agent API ─────────────────────────────────────────────
-  api:
-    build: .
+  api-agent:
+    image: 192.168.100.43:5000/modata.agent.system:0.0.1
     container_name: modata-agent-api
     restart: unless-stopped
     env_file: .env
     environment:
       PG_HOST: postgres
-      # MCP_GATEWAY_URL trỏ đến modata-mcp đang chạy bên ngoài
-      # Ghi đè ở đây nếu cần, hoặc để trong .env
     ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - "8006:8000"
+    networks:
+      - modata-ai
+    extra_hosts:
+      - "mongo-node1:192.168.100.103"
+      - "mongo-node2:192.168.100.104"
+      - "mongo-node3:192.168.100.105"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 20s
@@ -41,9 +42,9 @@ services:
       retries: 5
       start_period: 20s
 
-volumes:
-  postgres_data:
-
 networks:
-  default:
-    name: modata-agent-network
+  modata-ai:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "173.20.0.0/16"

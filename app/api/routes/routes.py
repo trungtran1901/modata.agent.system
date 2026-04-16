@@ -22,13 +22,35 @@ chat_router = APIRouter(prefix="/chat", tags=["Chat"])
 
 # ── Auth dependency ───────────────────────────────────────────
 
-async def get_user(authorization: str = Header(...)) -> UserPermissionContext:
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Cần header: Authorization: Bearer <token>")
-    try:
-        return await _perm_svc.build_context(authorization)
-    except PermissionError as e:
-        raise HTTPException(401, str(e))
+async def get_user(
+    authorization: Optional[str] = Header(None),
+    x_api_key:     Optional[str] = Header(None, alias="X-Api-Key"),
+) -> UserPermissionContext:
+    """
+    Hỗ trợ 2 phương thức xác thực (ưu tiên theo thứ tự):
+      1. Bearer JWT  — header: Authorization: Bearer <token>
+      2. API Key     — header: X-Api-Key: <api_key>
+    """
+    # Phương thức 1: Bearer JWT
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Header Authorization không hợp lệ. Dùng: Bearer <token>")
+        try:
+            return await _perm_svc.build_context(authorization)
+        except PermissionError as e:
+            raise HTTPException(401, str(e))
+
+    # Phương thức 2: API Key
+    if x_api_key:
+        try:
+            return _perm_svc.build_context_from_api_key(x_api_key)
+        except PermissionError as e:
+            raise HTTPException(401, str(e))
+
+    raise HTTPException(
+        401,
+        "Cần xác thực. Truyền 'Authorization: Bearer <token>' hoặc 'X-Api-Key: <api_key>'",
+    )
 
 
 # ── Request / Response models ─────────────────────────────────
@@ -55,13 +77,17 @@ async def chat(
 ):
     """
     Chat endpoint — Agno AgentOS Multi-Agent System.
-    
+
+    Xác thực qua:
+    - `Authorization: Bearer <token>` (Keycloak JWT)
+    - `X-Api-Key: <api_key>` (API Key trong MongoDB)
+
     Automatically routes query to specialized agents:
     - CheckinAgent (chấm công, giờ vào ra)
     - DataQueryAgent (nhân viên, hợp đồng, phép)
     - AnalyticsAgent (thống kê, count, group by)
     - CoordinatorAgent (phối hợp)
-    
+
     Returns:
       - answer: Final answer from agents
       - agents_used: List of agents that processed the query
@@ -71,15 +97,14 @@ async def chat(
     try:
         sid     = req.session_id or str(uuid.uuid4())
         history = session_store.load(sid)
-        
+
         result = await chat_with_agentosagno(
             query=req.query,
             user=user,
             session_id=sid,
             history=history,
         )
-        
-        # Ensure response is JSON-serializable
+
         return ChatResponse(
             session_id=result.get("session_id", sid),
             answer=str(result.get("answer", "")),

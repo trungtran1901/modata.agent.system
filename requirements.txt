@@ -7,9 +7,13 @@ uvicorn[standard]>=0.29.0
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 
-# AgentOS + MCP (tối ưu cho nhiều tools)
+# Agno (AgentOS framework) - imports use both 'agno' and 'agentos'
+agno>=0.2.0
 agentos>=0.2.0
 mcp>=1.0.0
+
+# LLM APIs (OpenAI-compatible)
+openai>=1.0.0
 
 # Redis (permission store, caching)
 redis>=5.0.0
@@ -30,3 +34,10 @@ python-jose[cryptography]>=3.3.0
 
 # Logging & Monitoring
 structlog>=24.1.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Testing (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.22.0

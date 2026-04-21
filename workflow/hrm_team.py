@@ -40,7 +40,7 @@ from agno.db.sqlite import SqliteDb
 from utils.qwen_model import QwenOpenAILike as OpenAILike
 from agno.os import AgentOS
 from agno.registry import Registry
-from agno.team import Team
+from agno.team import Team, TeamMode
 from agno.tools.mcp import MCPTools
 from fastapi import FastAPI
 
@@ -249,10 +249,12 @@ def _make_model(max_tokens: int = 512) -> OpenAILike:
         temperature=0.1,
         request_params={
             "tool_choice": "auto",
+            # NOTE: Removed stream: False and stream_options to avoid vLLM validation error
+            # vLLM rejects: "Stream options can only be defined when stream=True"
+            # Agno will default to stream=False anyway
             "extra_body": {
                 "enable_thinking": False,
                 "thinking_budget": 0,
-                "stream": False,
             },
         },
     )
@@ -293,6 +295,7 @@ def _build_hrm_agents() -> list[Agent]:
         url=settings.MCP_GATEWAY_URL,
         transport="sse",
     )
+    logger.info(f"✓ MCPTools initialized: url={settings.MCP_GATEWAY_URL}, transport=sse")
 
     common = dict(
         tools=[mcp],
@@ -390,7 +393,7 @@ def _build_hrm_team(agents: list[Agent]) -> Team:
         id=TEAM_ID_HRM,
         name="HRM Team",
         description="Đội trợ lý AI nhân sự HITC — điều phối các agent chuyên biệt theo yêu cầu.",
-        mode="route",
+        mode=TeamMode.route,
         # Router dùng model nhỏ: chỉ cần chọn agent, không sinh nội dung
         model=_make_model(max_tokens=16384),
         members=agents,

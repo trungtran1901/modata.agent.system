@@ -107,6 +107,50 @@ class SessionStore:
         except Exception as e:
             logger.warning("Save context PG error: %s", e)
 
+    def get_context(self, session_id: str) -> dict | None:
+        """
+        Retrieve user context (user_id, username, accessible_context, company_code)
+        from session.
+
+        Returns:
+            dict with keys: user_id, username, accessible_context, company_code
+            None if session not found
+
+        Used by:
+            - MCP tools to validate permissions
+            - Agents to retrieve user information
+        """
+        try:
+            with self._conn().cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, username, accessible_context, company_code
+                    FROM rag_sessions
+                    WHERE session_id = %s
+                """, (session_id,))
+                row = cur.fetchone()
+
+            if not row:
+                logger.debug("Session context not found: %s", session_id)
+                return None
+
+            context = dict(row)
+            # Parse accessible_context JSON if stored as string
+            if isinstance(context.get("accessible_context"), str):
+                try:
+                    context["accessible_context"] = json.loads(context["accessible_context"])
+                except json.JSONDecodeError:
+                    context["accessible_context"] = {}
+
+            logger.debug(
+                "Retrieved context for session %s: user=%s company=%s",
+                session_id, context.get("username"), context.get("company_code"),
+            )
+            return context
+
+        except Exception as e:
+            logger.warning("Get context PG error: %s", e)
+            return None
+
     # ── Messages ──────────────────────────────────────────────
 
     def load(self, session_id: str) -> list[dict]:

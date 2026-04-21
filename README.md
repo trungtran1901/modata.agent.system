@@ -141,6 +141,75 @@ Mỗi request có `session_id` (tự sinh nếu không truyền).
 Lịch sử hội thoại lưu tại `PostgreSQL.rag_sessions.messages`.
 `accessible_instance_names` cũng lưu trong bảng này để MCP Gateway đọc.
 
+## 📚 Documentation
+
+### User Context Flow & Permission Integration
+
+Để hiểu cách `UserPermissionContext` được truyền từ route → workflow → team → agent → MCP tool:
+
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** ⚡ - Bắt đầu từ đây! (1-5 phút)
+  - Sơ đồ flow, pattern cơ bản, ví dụ nhanh
+
+- **[HITC_AGENTOS_USER_CONTEXT_FLOW.md](HITC_AGENTOS_USER_CONTEXT_FLOW.md)** - Chi tiết kiến trúc (15 phút)
+  - Complete architecture diagram
+  - Từng layer chi tiết (route → workflow → team → agent → MCP tool)
+  - Cách MCP tool sử dụng user context
+  - Security considerations
+
+- **[HITC_AGENTOS_INTEGRATION_GUIDE.md](HITC_AGENTOS_INTEGRATION_GUIDE.md)** - Cách tích hợp (20 phút)
+  - Cách dùng `chat_with_hitc()` vs `create_hitc_agent_os_app()`
+  - Hai integration patterns: recommended vs lower-level
+  - Practical examples (leave requests, streaming)
+  - Debugging techniques
+
+- **[HITC_AGENTOS_XAPIKEY_GUIDE.md](HITC_AGENTOS_XAPIKEY_GUIDE.md)** - X-Api-Key authentication (15 phút)
+  - Cách dùng X-Api-Key thay cho Bearer token
+  - API key lookup & UserPermissionContext extraction
+  - Python, JavaScript, cURL examples
+  - Permission validation & filtering
+
+- **[TEAMS_ENDPOINT_AUTHENTICATION.md](TEAMS_ENDPOINT_AUTHENTICATION.md)** - Sử dụng `/teams/{id}/runs` (10 phút)
+  - ❌ Không thể pass token/API-key vào user_id
+  - ✅ Solution 1: Dùng `/hitc/chat` (recommended)
+  - ✅ Solution 2: Wrap endpoint với authentication
+  - Why & how so sánh
+
+- **[MCP_TOOL_TEMPLATE.md](MCP_TOOL_TEMPLATE.md)** - Implement MCP tools (25 phút)
+  - Pattern: Extract Context → Validate → Query → Filter
+  - Hai complete tool examples với permission checks
+  - Security best practices
+  - Unit test examples
+
+- **[TEST_XAPIKEY.md](TEST_XAPIKEY.md)** - Test & Debug (20 phút)
+  - Setup test API key
+  - Test cases (basic, invalid, session, streaming, permissions)
+  - Verify context in session
+  - Debug logging & troubleshooting
+
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Tóm tắt (10 phút)
+  - Những gì đã làm
+  - Complete system architecture
+  - Key components
+  - Next steps
+
+### System Flow
+
+```
+HTTP Request (với Auth)
+  ↓
+Route Layer (extract UserPermissionContext)
+  ↓
+Workflow: chat_with_hitc(query, user, session_id)
+  ↓
+Team Handler: save_context + inject_into_agents + augment_query
+  ↓
+Agent: invoke MCP tools with augmented query
+  ↓
+MCP Tool: get_context(session_id) → validate → filter results
+  ↓
+Response (only authorized data for user)
+```
+
 ## Deploy cùng modata-mcp
 
 Nếu muốn chạy cả 2 project cùng Docker network:
